@@ -5,9 +5,10 @@
 #include "esp_log.h"
 
 /*  This code generates two waveforms from the ESP32-S3:
- *   1) a series ("burst") of PULSE_COUNT_PER_BURST pulses at ~1.8 MHz
+ *   1) a series ("burst") of PULSE_COUNT_PER_BURST pulses at ~1.8 MHz, optionally
+ *      followed by a hold at BURST_HOLD_LEVEL for BURST_HOLD_TICKS
  *   2) a "Hi-Z" signal which gates a driver chip into a high-impedance state
- *      (low during the pulse outputs, high otherwise)
+ *      (low during the pulse outputs and the hold, high otherwise)
  *
  *  The two waveforms must be aligned in time precisely. An earlier version drove
  *  the Hi-Z signal from a general purpose timer; that could not hold the required
@@ -38,13 +39,16 @@ static rmt_encoder_handle_t s_hiZ_encoder    = NULL;
 
 static rmt_sync_manager_handle_t s_sync      = NULL;
 
-/* +1 for the optional idle lead-in symbol (see HIZ_LEAD_TICKS). */
-static rmt_symbol_word_t s_burst_symbols[PULSE_COUNT_MAX + 1];
+/* Optional idle lead-in (HIZ_LEAD_TICKS), the pulses themselves, then the
+ * optional post-burst hold (BURST_HOLD_TICKS). */
+static rmt_symbol_word_t s_burst_symbols[HIZ_LEAD_SYMBOLS + PULSE_COUNT_MAX +
+                                         BURST_HOLD_SYMBOLS];
 static size_t            s_burst_symbol_count;
 
-/* The whole low window fits in one symbol: each duration field is 15 bits, so a
- * symbol spans up to 65534 ticks -- far beyond any PULSE_COUNT_MAX burst. */
-static rmt_symbol_word_t s_hiZ_symbols[1];
+/* Usually one symbol: each duration field is 15 bits, so a symbol spans up to
+ * 65534 ticks -- ~18 ms, longer than any burst. A long post-burst hold is the
+ * one thing that can push the window past that, hence the run of symbols. */
+static rmt_symbol_word_t s_hiZ_symbols[HIZ_LOW_SYMBOLS];
 static size_t            s_hiZ_symbol_count;
 
 _Static_assert(PULSE_COUNT_PER_BURST <= PULSE_COUNT_MAX,
@@ -53,27 +57,63 @@ _Static_assert(HIZ_LEAD_TICKS == 0 || HIZ_LEAD_TICKS >= 2,
                "HIZ_LEAD_TICKS must be 0 or >= 2 ticks");
 _Static_assert(HIZ_TAIL_TICKS == 0 || HIZ_TAIL_TICKS >= 2,
                "HIZ_TAIL_TICKS must be 0 or >= 2 ticks");
-_Static_assert(HIZ_LOW_TICKS <= 65534U,
-               "Hi-Z low window does not fit in one RMT symbol");
+_Static_assert(BURST_HOLD_TICKS == 0 || BURST_HOLD_TICKS >= 2,
+               "BURST_HOLD_TICKS must be 0 or >= 2 ticks");
+
+/* Both waveforms must fit in channel memory alongside the driver's
+ * end-of-transmission marker, otherwise transmitting needs a refill ISR. */
+_Static_assert(HIZ_LEAD_SYMBOLS + PULSE_COUNT_MAX + BURST_HOLD_SYMBOLS
+                   <= RMT_MEM_BLOCK_SYMBOLS - 1,
+               "burst waveform does not fit in one RMT memory block");
+_Static_assert(HIZ_LOW_SYMBOLS <= RMT_MEM_BLOCK_SYMBOLS - 1,
+               "Hi-Z waveform does not fit in one RMT memory block");
 
 /* -------------------------------------------------------------------- */
 /* Waveform tables                                                       */
 /* -------------------------------------------------------------------- */
 
-/* Pulse burst on GPIO_BURST_DRIVE. Each rmt_symbol_word_t after the optional
- * lead-in is one full cycle: 1 tick high, 1 tick low. */
+/* Emit `ticks` of steady `level` into `dst`, using as many symbols as the 15-bit
+ * duration fields require, and return how many symbols that took. Every half
+ * written is non-zero -- a duration of 0 is the RMT end-of-transmission marker,
+ * so a stray zero would truncate the waveform. `ticks` must be 0 or >= 2.
+ *
+ * This is only ever used for steady levels (the lead-in, the post-burst hold,
+ * the Hi-Z envelope). The pulses are built directly, one symbol per cycle, so
+ * the output frequency does not depend on anything here. */
+static size_t emit_level(rmt_symbol_word_t *dst, unsigned level, uint32_t ticks)
+{
+    size_t n = 0;
+
+    while (ticks > 0) {
+        uint32_t chunk = (ticks > RMT_SYMBOL_MAX_TICKS) ? RMT_SYMBOL_MAX_TICKS : ticks;
+
+        /* Never leave a 1-tick remainder: it could not be split into two
+         * non-zero halves on the next pass. */
+        if (ticks - chunk == 1) {
+            chunk--;
+        }
+
+        dst[n].level0    = level;
+        dst[n].duration0 = chunk - (chunk / 2);
+        dst[n].level1    = level;
+        dst[n].duration1 = chunk / 2;
+        n++;
+
+        ticks -= chunk;
+    }
+
+    return n;
+}
+
+/* Pulse burst on GPIO_BURST_DRIVE: an optional idle lead-in, then one symbol per
+ * full cycle (1 tick high, 1 tick low), then an optional hold at
+ * BURST_HOLD_LEVEL. The line returns to 0 via the transmit config's eot_level. */
 static void build_burst_symbols(void)
 {
     size_t n = 0;
 
-#if HIZ_LEAD_TICKS > 0
-    /* Stay idle while the gate leads. Both halves must be non-zero. */
-    s_burst_symbols[n].level0    = 0;
-    s_burst_symbols[n].duration0 = HIZ_LEAD_TICKS - (HIZ_LEAD_TICKS / 2);
-    s_burst_symbols[n].level1    = 0;
-    s_burst_symbols[n].duration1 = HIZ_LEAD_TICKS / 2;
-    n++;
-#endif
+    /* Stay idle while the gate leads. */
+    n += emit_level(&s_burst_symbols[n], 0, HIZ_LEAD_TICKS);
 
     for (int i = 0; i < PULSE_COUNT_PER_BURST; i++) {
         s_burst_symbols[n].level0    = 1;
@@ -83,20 +123,18 @@ static void build_burst_symbols(void)
         n++;
     }
 
+    /* Park the line for the programmed hold, if any. */
+    n += emit_level(&s_burst_symbols[n], BURST_HOLD_LEVEL, BURST_HOLD_TICKS);
+
     s_burst_symbol_count = n;
 }
 
 /* Hi-Z envelope on GPIO_HIZ_DRIVE: hold the gate in the Low-Z state for exactly
- * HIZ_LOW_TICKS, split across the two halves of one symbol. The line returns to
- * Hi-Z via the transmit config's eot_level. */
+ * HIZ_LOW_TICKS, which spans the lead-in, the burst and the post-burst hold. The
+ * line returns to Hi-Z via the transmit config's eot_level. */
 static void build_hiZ_symbols(void)
 {
-    s_hiZ_symbols[0].level0    = STATE_LO_Z;
-    s_hiZ_symbols[0].duration0 = HIZ_LOW_TICKS - (HIZ_LOW_TICKS / 2);
-    s_hiZ_symbols[0].level1    = STATE_LO_Z;
-    s_hiZ_symbols[0].duration1 = HIZ_LOW_TICKS / 2;
-
-    s_hiZ_symbol_count = 1;
+    s_hiZ_symbol_count = emit_level(s_hiZ_symbols, STATE_LO_Z, HIZ_LOW_TICKS);
 }
 
 /* -------------------------------------------------------------------- */
@@ -176,9 +214,10 @@ void rmt_burst_task(void *arg)
                                      &burst_tx_config));
 
         /* Both must be idle before the next rmt_sync_reset(). The burst itself is
-         * only a few microseconds; 10 ms is a generous fault timeout. */
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_burst_chan, 10));
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_hiZ_chan, 10));
+         * only a few microseconds, but a long post-burst hold is not, so the
+         * fault timeout tracks the waveform length (see BURST_WAIT_TIMEOUT_MS). */
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_burst_chan, BURST_WAIT_TIMEOUT_MS));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_hiZ_chan, BURST_WAIT_TIMEOUT_MS));
 
         vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
     }
@@ -187,8 +226,10 @@ void rmt_burst_task(void *arg)
 void app_main(void)
 {
     rmt_burst_init();
-    ESP_LOGI(TAG, " rmt burst init completed (%u pulses, %u ticks Hi-Z window)",
-             (unsigned)PULSE_COUNT_PER_BURST, (unsigned)HIZ_LOW_TICKS);
+    ESP_LOGI(TAG, " rmt burst init completed (%u pulses, %u ticks Hi-Z window, "
+                  "hold %u ticks at %u)",
+             (unsigned)PULSE_COUNT_PER_BURST, (unsigned)HIZ_LOW_TICKS,
+             (unsigned)BURST_HOLD_TICKS, (unsigned)BURST_HOLD_LEVEL);
 
     xTaskCreate(rmt_burst_task, "rmt_burst_task", 4096, NULL, 5, NULL);
     ESP_LOGI(TAG, " task started");

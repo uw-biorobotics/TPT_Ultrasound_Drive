@@ -1,6 +1,8 @@
 #ifndef US_TST2_H
 #define US_TST2_H
 
+#include <stdint.h>
+
 #include "driver/gpio.h"
 #include "soc/gpio_reg.h"
 
@@ -35,17 +37,47 @@
  * channels consumes all four TX blocks in the group. */
 #define RMT_MEM_BLOCK_SYMBOLS   48
 
+/* An RMT symbol carries two 15-bit duration fields, so one symbol spans at most
+ * 2 * 32767 ticks. Any longer steady level is emitted as a run of symbols. */
+#define RMT_SYMBOL_MAX_TICKS    65534U
+#define TICKS_TO_SYMBOLS(t)     (((t) + RMT_SYMBOL_MAX_TICKS - 1U) / RMT_SYMBOL_MAX_TICKS)
+
+/* Convenience: express a duration in microseconds instead of RMT ticks. */
+#define TICKS_FROM_US(us)       ((uint32_t)(((uint64_t)(us) * RMT_RESOLUTION_HZ) / 1000000U))
+
+/* ---- Post-burst hold ----
+ * After the last pulse the burst line can either drop straight to 0 (set
+ * BURST_HOLD_TICKS to 0 -- the original behaviour) or be parked at
+ * BURST_HOLD_LEVEL for BURST_HOLD_TICKS before returning to the resting level.
+ * The hold is emitted as extra symbols at the tail of the burst waveform, and
+ * the Hi-Z gate is held in the Lo-Z state for its whole duration (a level the
+ * driver is not actually driving would be pointless).
+ * Ticks must be 0 or >= 2 (a duration field of 0 is the RMT end-of-transmission
+ * marker, so each emitted half must be non-zero).
+ * e.g. TICKS_FROM_US(50) for a 50 us hold. */
+#define BURST_HOLD_LEVEL        1     /* level parked on GPIO_BURST_DRIVE */
+#define BURST_HOLD_TICKS        4U    /* 0 = no hold; the line drops low at once */
+
 /* ---- Hi-Z envelope timing ----
- * The gate is driven low for the whole burst, plus optional guard bands before
- * and after. A non-zero lead also inserts a matching idle symbol at the head of
- * the burst waveform, so the two channels stay tick-aligned.
- * Guard values must be 0 or >= 2 ticks (a duration field of 0 is the RMT
- * end-of-transmission marker, so each emitted half must be non-zero). */
+ * The gate is driven low for the whole burst and any post-burst hold, plus
+ * optional guard bands before and after. A non-zero lead also inserts a matching
+ * idle symbol at the head of the burst waveform, so the two channels stay
+ * tick-aligned. Same 0-or->=2 rule as above. */
 #define HIZ_LEAD_TICKS          0U    /* ticks the gate leads the first pulse */
-#define HIZ_TAIL_TICKS          0U    /* ticks the gate lags the last pulse */
+#define HIZ_TAIL_TICKS          0U    /* ticks the gate lags the end of the hold */
 
 #define BURST_TICKS     (PULSE_COUNT_PER_BURST * RMT_TICKS_PER_CYCLE)
-#define HIZ_LOW_TICKS   (HIZ_LEAD_TICKS + BURST_TICKS + HIZ_TAIL_TICKS)
+#define HIZ_LOW_TICKS   (HIZ_LEAD_TICKS + BURST_TICKS + BURST_HOLD_TICKS + HIZ_TAIL_TICKS)
+
+/* Symbol budget per channel, checked against RMT_MEM_BLOCK_SYMBOLS in US_TST.c. */
+#define HIZ_LEAD_SYMBOLS    TICKS_TO_SYMBOLS(HIZ_LEAD_TICKS)
+#define BURST_HOLD_SYMBOLS  TICKS_TO_SYMBOLS(BURST_HOLD_TICKS)
+#define HIZ_LOW_SYMBOLS     TICKS_TO_SYMBOLS(HIZ_LOW_TICKS)
+
+/* Fault timeout for rmt_tx_wait_all_done(): the waveform's own length (ticks/ms
+ * = RMT_RESOLUTION_HZ/1000) plus 10 ms of slack. */
+#define BURST_WAIT_TIMEOUT_MS \
+    ((int)(HIZ_LOW_TICKS / (RMT_RESOLUTION_HZ / 1000U)) + 10)
 
 /* ---- Function prototypes ---- */
 void rmt_burst_init(void);
