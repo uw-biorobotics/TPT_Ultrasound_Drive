@@ -5,10 +5,13 @@
 #include "esp_log.h"
 
 /*  This code generates two waveforms from the ESP32-S3:
- *   1) a series ("burst") of PULSE_COUNT_PER_BURST pulses at ~1.8 MHz, optionally
- *      followed by a hold at BURST_HOLD_LEVEL for BURST_HOLD_TICKS
+ *   1) a series ("burst") of pulse_count pulses at ~1.8 MHz, optionally followed
+ *      by a hold at hold_level for hold_ticks
  *   2) a "Hi-Z" signal which gates a driver chip into a high-impedance state
  *      (low during the pulse outputs and the hold, high otherwise)
+ *
+ *  The numbers come from the active burst_config_t -- see the cfg_* presets and
+ *  ACTIVE_CONFIG immediately below.
  *
  *  The two waveforms must be aligned in time precisely. An earlier version drove
  *  the Hi-Z signal from a general purpose timer; that could not hold the required
@@ -28,6 +31,103 @@
 
 static const char *TAG = "rmt_burst test";
 
+/* -------------------------------------------------------------------- */
+/* Configuration presets                                                 */
+/* -------------------------------------------------------------------- */
+
+/* One struct per configuration, all of them literals right here. cfg_default
+ * takes its values from the #defines in US_TST.h, so a quick one-off experiment
+ * is still just an edit there; the rest spell their numbers out. Any field a
+ * struct leaves out is zero.
+ *
+ * rmt_burst_init() copies exactly one of these into g_burst_cfg -- whichever
+ * ACTIVE_CONFIG names, just below the last struct. That one edit is the whole
+ * switch. Add more structs freely; only the selected one ends up in the build.
+ *
+ * Only one is referenced per build, so the others would otherwise draw
+ * "defined but not used" warnings. */
+#define PRESET  static const burst_config_t __attribute__((unused))
+
+/*
+ *  showing the struct for reference:
+ */
+//typedef struct {
+//    const char *name;            /* shown in the boot log */
+//    gpio_num_t  burst_gpio;      /* pin carrying the pulse train */
+//    gpio_num_t  hiz_gpio;        /* pin carrying the Hi-Z gate */
+//    uint32_t    resolution_hz;   /* RMT tick rate; pulse freq = this / RMT_TICKS_PER_CYCLE */
+//    uint16_t    pulse_count;     /* full square-wave cycles per burst */
+//    uint8_t     hold_level;      /* level parked on the burst pin after the pulses */
+//    uint32_t    hold_ticks;      /* duration of that hold; 0 = none */
+//    uint32_t    hiz_lead_ticks;  /* gate leads the first pulse by this much */
+//    uint32_t    hiz_tail_ticks;  /* gate lags the end of the hold by this much */
+// } burst_config_t;
+
+
+PRESET cfg_default = {           /* whatever the #defines in US_TST.h say */
+    .name           = "default",
+    .burst_gpio     = GPIO_BURST_DRIVE,
+    .hiz_gpio       = GPIO_HIZ_DRIVE,
+    .resolution_hz  = RMT_RESOLUTION_HZ,
+    .pulse_count    = PULSE_COUNT_PER_BURST,
+    .hold_level     = POST_BURST_HOLD_LEVEL,
+    .hold_ticks     = POST_BURST_HOLD_TICKS,
+    .hiz_lead_ticks = HIZ_LEAD_TICKS,
+    .hiz_tail_ticks = HIZ_TAIL_TICKS,
+};
+
+PRESET cfg_no_hold = {           /* original behaviour: low right after the burst */
+    .name           = "no-hold",
+    .burst_gpio     = GPIO_NUM_9,
+    .hiz_gpio       = GPIO_NUM_10,
+    .resolution_hz  = 3636364U,  /* ~1.818 MHz pulses */
+    .pulse_count    = 8,
+    .hold_level     = 0,
+    .hold_ticks     = 0,
+};
+
+PRESET cfg_long_hold = {         /* 50 us hold high -- easy to see on a slow timebase */
+    .name           = "long-hold",
+    .burst_gpio     = GPIO_NUM_9,
+    .hiz_gpio       = GPIO_NUM_10,
+    .resolution_hz  = 3636364U,
+    .pulse_count    = 8,
+    .hold_level     = 1,
+    .hold_ticks     = TICKS_FROM_US_AT(50, 3636364U),   /* 181 ticks */
+};
+
+PRESET cfg_max_burst = {         /* longest burst that fits in one RMT memory block */
+    .name           = "max-burst",
+    .burst_gpio     = GPIO_NUM_9,
+    .hiz_gpio       = GPIO_NUM_10,
+    .resolution_hz  = 3636364U,
+    .pulse_count    = 46,        /* 47 symbols available, 1 spent on the hold */
+    .hold_level     = 1,
+    .hold_ticks     = 4,
+};
+
+PRESET cfg_guarded = {           /* guard bands on both ends, to check gate alignment */
+    .name           = "guarded",
+    .burst_gpio     = GPIO_NUM_9,
+    .hiz_gpio       = GPIO_NUM_10,
+    .resolution_hz  = 3636364U,
+    .pulse_count    = 8,
+    .hold_level     = 1,
+    .hold_ticks     = 2,
+    .hiz_lead_ticks = 4,
+    .hiz_tail_ticks = 4,
+};
+
+/* >>> The one edit that switches configurations. <<< */
+// #define ACTIVE_CONFIG   cfg_default
+#define ACTIVE_CONFIG   cfg_long_hold
+
+burst_config_t g_burst_cfg;   /* the live config; loaded by rmt_burst_init() */
+
+/* -------------------------------------------------------------------- */
+/* State                                                                 */
+/* -------------------------------------------------------------------- */
+
 static rmt_channel_handle_t s_burst_chan     = NULL;  /* for the pulses */
 static rmt_channel_handle_t s_hiZ_chan       = NULL;  /* for the impedance signal */
 
@@ -39,34 +139,108 @@ static rmt_encoder_handle_t s_hiZ_encoder    = NULL;
 
 static rmt_sync_manager_handle_t s_sync      = NULL;
 
-/* Optional idle lead-in (HIZ_LEAD_TICKS), the pulses themselves, then the
- * optional post-burst hold (BURST_HOLD_TICKS). */
-static rmt_symbol_word_t s_burst_symbols[HIZ_LEAD_SYMBOLS + PULSE_COUNT_MAX +
-                                         BURST_HOLD_SYMBOLS];
+/* Both tables are sized for the largest waveform the hardware can hold, since
+ * the config is no longer known at compile time. That is 47 symbols -- 188 bytes
+ * each, cheap enough not to bother being clever about. */
+static rmt_symbol_word_t s_burst_symbols[BURST_SYMBOLS_MAX];
 static size_t            s_burst_symbol_count;
 
-/* Usually one symbol: each duration field is 15 bits, so a symbol spans up to
- * 65534 ticks -- ~18 ms, longer than any burst. A long post-burst hold is the
- * one thing that can push the window past that, hence the run of symbols. */
-static rmt_symbol_word_t s_hiZ_symbols[HIZ_LOW_SYMBOLS];
+static rmt_symbol_word_t s_hiZ_symbols[BURST_SYMBOLS_MAX];
 static size_t            s_hiZ_symbol_count;
 
-_Static_assert(PULSE_COUNT_PER_BURST <= PULSE_COUNT_MAX,
-               "PULSE_COUNT_PER_BURST exceeds PULSE_COUNT_MAX (grow the arrays)");
-_Static_assert(HIZ_LEAD_TICKS == 0 || HIZ_LEAD_TICKS >= 2,
-               "HIZ_LEAD_TICKS must be 0 or >= 2 ticks");
-_Static_assert(HIZ_TAIL_TICKS == 0 || HIZ_TAIL_TICKS >= 2,
-               "HIZ_TAIL_TICKS must be 0 or >= 2 ticks");
-_Static_assert(BURST_HOLD_TICKS == 0 || BURST_HOLD_TICKS >= 2,
-               "BURST_HOLD_TICKS must be 0 or >= 2 ticks");
+/* Fault timeout for rmt_tx_wait_all_done(), derived from the waveform length in
+ * rmt_burst_init(). A long post-burst hold can outlast a fixed timeout. */
+static int               s_wait_timeout_ms;
 
-/* Both waveforms must fit in channel memory alongside the driver's
- * end-of-transmission marker, otherwise transmitting needs a refill ISR. */
-_Static_assert(HIZ_LEAD_SYMBOLS + PULSE_COUNT_MAX + BURST_HOLD_SYMBOLS
-                   <= RMT_MEM_BLOCK_SYMBOLS - 1,
-               "burst waveform does not fit in one RMT memory block");
-_Static_assert(HIZ_LOW_SYMBOLS <= RMT_MEM_BLOCK_SYMBOLS - 1,
-               "Hi-Z waveform does not fit in one RMT memory block");
+/* -------------------------------------------------------------------- */
+/* Derived quantities                                                    */
+/* -------------------------------------------------------------------- */
+
+/* Ticks the pulses themselves occupy. */
+static uint32_t cfg_burst_ticks(const burst_config_t *cfg)
+{
+    return (uint32_t)cfg->pulse_count * RMT_TICKS_PER_CYCLE;
+}
+
+/* The Hi-Z low window: lead-in + pulses + hold + tail. This is also the total
+ * length of a round, so the wait timeout is computed from it. */
+static uint32_t cfg_hiZ_low_ticks(const burst_config_t *cfg)
+{
+    return cfg->hiz_lead_ticks + cfg_burst_ticks(cfg) +
+           cfg->hold_ticks + cfg->hiz_tail_ticks;
+}
+
+/* Symbols needed to express `ticks` of one steady level. */
+static uint32_t ticks_to_symbols(uint32_t ticks)
+{
+    return (ticks + RMT_SYMBOL_MAX_TICKS - 1U) / RMT_SYMBOL_MAX_TICKS;
+}
+
+/* Symbols the burst waveform occupies: lead-in + one per cycle + hold. */
+static uint32_t cfg_burst_symbols(const burst_config_t *cfg)
+{
+    return ticks_to_symbols(cfg->hiz_lead_ticks) + cfg->pulse_count +
+           ticks_to_symbols(cfg->hold_ticks);
+}
+
+/* -------------------------------------------------------------------- */
+/* Configuration checking                                                */
+/* -------------------------------------------------------------------- */
+
+/* What the _Static_asserts used to cover, now that the values arrive at runtime.
+ * Called before anything is built, and its result is ESP_ERROR_CHECK'd, so a bad
+ * preset stops the boot with a named reason rather than emitting a broken
+ * waveform. */
+static esp_err_t validate_config(const burst_config_t *cfg)
+{
+#define CFG_REQUIRE(cond, fmt, ...)                                            \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            ESP_LOGE(TAG, "config \"%s\": " fmt, cfg->name, ##__VA_ARGS__);    \
+            return ESP_ERR_INVALID_ARG;                                        \
+        }                                                                      \
+    } while (0)
+
+    /* Only a range and a clash check here -- rmt_new_tx_channel() does the real
+     * work of rejecting a pin that cannot drive an output, and its error is
+     * caught by the ESP_ERROR_CHECK around it. */
+    CFG_REQUIRE(cfg->burst_gpio >= 0 && cfg->burst_gpio < GPIO_NUM_MAX,
+                "burst_gpio %d is not a GPIO number", (int)cfg->burst_gpio);
+    CFG_REQUIRE(cfg->hiz_gpio >= 0 && cfg->hiz_gpio < GPIO_NUM_MAX,
+                "hiz_gpio %d is not a GPIO number", (int)cfg->hiz_gpio);
+    CFG_REQUIRE(cfg->burst_gpio != cfg->hiz_gpio,
+                "burst_gpio and hiz_gpio are both %d", (int)cfg->burst_gpio);
+
+    /* /1000 in the timeout math below, and /2 for the pulse frequency. */
+    CFG_REQUIRE(cfg->resolution_hz >= 1000U,
+                "resolution_hz %u is below 1 kHz", (unsigned)cfg->resolution_hz);
+    CFG_REQUIRE(cfg->pulse_count >= 1,
+                "pulse_count is 0");
+    CFG_REQUIRE(cfg->hold_level <= 1,
+                "hold_level %u is not 0 or 1", (unsigned)cfg->hold_level);
+
+    /* A duration field of 0 is the end-of-transmission marker, and emit_level()
+     * splits a run across two halves, so a lone tick cannot be expressed. */
+    CFG_REQUIRE(cfg->hold_ticks == 0 || cfg->hold_ticks >= 2,
+                "hold_ticks %u must be 0 or >= 2", (unsigned)cfg->hold_ticks);
+    CFG_REQUIRE(cfg->hiz_lead_ticks == 0 || cfg->hiz_lead_ticks >= 2,
+                "hiz_lead_ticks %u must be 0 or >= 2", (unsigned)cfg->hiz_lead_ticks);
+    CFG_REQUIRE(cfg->hiz_tail_ticks == 0 || cfg->hiz_tail_ticks >= 2,
+                "hiz_tail_ticks %u must be 0 or >= 2", (unsigned)cfg->hiz_tail_ticks);
+
+    /* Both waveforms have to fit in one RMT memory block, otherwise transmitting
+     * them would need a refill ISR. */
+    CFG_REQUIRE(cfg_burst_symbols(cfg) <= BURST_SYMBOLS_MAX,
+                "burst needs %u symbols, only %u fit in one RMT memory block",
+                (unsigned)cfg_burst_symbols(cfg), (unsigned)BURST_SYMBOLS_MAX);
+    CFG_REQUIRE(ticks_to_symbols(cfg_hiZ_low_ticks(cfg)) <= BURST_SYMBOLS_MAX,
+                "Hi-Z window needs %u symbols, only %u fit in one RMT memory block",
+                (unsigned)ticks_to_symbols(cfg_hiZ_low_ticks(cfg)),
+                (unsigned)BURST_SYMBOLS_MAX);
+
+#undef CFG_REQUIRE
+    return ESP_OK;
+}
 
 /* -------------------------------------------------------------------- */
 /* Waveform tables                                                       */
@@ -105,17 +279,17 @@ static size_t emit_level(rmt_symbol_word_t *dst, unsigned level, uint32_t ticks)
     return n;
 }
 
-/* Pulse burst on GPIO_BURST_DRIVE: an optional idle lead-in, then one symbol per
- * full cycle (1 tick high, 1 tick low), then an optional hold at
- * BURST_HOLD_LEVEL. The line returns to 0 via the transmit config's eot_level. */
-static void build_burst_symbols(void)
+/* Pulse burst on cfg->burst_gpio: an optional idle lead-in, then one symbol per
+ * full cycle (1 tick high, 1 tick low), then an optional hold at hold_level. The
+ * line returns to 0 via the transmit config's eot_level. */
+static void build_burst_symbols(const burst_config_t *cfg)
 {
     size_t n = 0;
 
     /* Stay idle while the gate leads. */
-    n += emit_level(&s_burst_symbols[n], 0, HIZ_LEAD_TICKS);
+    n += emit_level(&s_burst_symbols[n], 0, cfg->hiz_lead_ticks);
 
-    for (int i = 0; i < PULSE_COUNT_PER_BURST; i++) {
+    for (uint16_t i = 0; i < cfg->pulse_count; i++) {
         s_burst_symbols[n].level0    = 1;
         s_burst_symbols[n].duration0 = 1;
         s_burst_symbols[n].level1    = 0;
@@ -124,17 +298,17 @@ static void build_burst_symbols(void)
     }
 
     /* Park the line for the programmed hold, if any. */
-    n += emit_level(&s_burst_symbols[n], BURST_HOLD_LEVEL, BURST_HOLD_TICKS);
+    n += emit_level(&s_burst_symbols[n], cfg->hold_level, cfg->hold_ticks);
 
     s_burst_symbol_count = n;
 }
 
-/* Hi-Z envelope on GPIO_HIZ_DRIVE: hold the gate in the Low-Z state for exactly
- * HIZ_LOW_TICKS, which spans the lead-in, the burst and the post-burst hold. The
- * line returns to Hi-Z via the transmit config's eot_level. */
-static void build_hiZ_symbols(void)
+/* Hi-Z envelope on cfg->hiz_gpio: hold the gate in the Low-Z state for the
+ * whole window -- lead-in, burst and post-burst hold. The line returns to Hi-Z
+ * via the transmit config's eot_level. */
+static void build_hiZ_symbols(const burst_config_t *cfg)
 {
-    s_hiZ_symbol_count = emit_level(s_hiZ_symbols, STATE_LO_Z, HIZ_LOW_TICKS);
+    s_hiZ_symbol_count = emit_level(s_hiZ_symbols, STATE_LO_Z, cfg_hiZ_low_ticks(cfg));
 }
 
 /* -------------------------------------------------------------------- */
@@ -142,15 +316,23 @@ static void build_hiZ_symbols(void)
 /* -------------------------------------------------------------------- */
 void rmt_burst_init(void)
 {
-    build_burst_symbols();
-    build_hiZ_symbols();
+    /* Copy the selected preset into the working config, then check it. */
+    g_burst_cfg = ACTIVE_CONFIG;
+    ESP_ERROR_CHECK(validate_config(&g_burst_cfg));
+
+    build_burst_symbols(&g_burst_cfg);
+    build_hiZ_symbols(&g_burst_cfg);
+
+    /* The waveform's own length in ms, plus 10 ms of slack. */
+    s_wait_timeout_ms =
+        (int)(cfg_hiZ_low_ticks(&g_burst_cfg) / (g_burst_cfg.resolution_hz / 1000U)) + 10;
 
     /* Both channels must share clk_src and resolution_hz to be synchronizable. */
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src            = RMT_CLK_SRC_DEFAULT,
-        .gpio_num           = GPIO_BURST_DRIVE,
+        .gpio_num           = g_burst_cfg.burst_gpio,
         .mem_block_symbols  = RMT_MEM_BLOCK_SYMBOLS,
-        .resolution_hz      = RMT_RESOLUTION_HZ,
+        .resolution_hz      = g_burst_cfg.resolution_hz,
         .trans_queue_depth  = 1,
         .flags.invert_out   = false,
         .flags.with_dma     = false,
@@ -160,7 +342,7 @@ void rmt_burst_init(void)
 
     /* Same config, gate pin, and idling high so the driver chip is held in Hi-Z
      * from the moment the channel is created -- before the first transmission. */
-    tx_chan_config.gpio_num         = GPIO_HIZ_DRIVE;
+    tx_chan_config.gpio_num         = g_burst_cfg.hiz_gpio;
     tx_chan_config.flags.init_level = STATE_HI_Z;
     ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &s_hiZ_chan));
 
@@ -215,9 +397,9 @@ void rmt_burst_task(void *arg)
 
         /* Both must be idle before the next rmt_sync_reset(). The burst itself is
          * only a few microseconds, but a long post-burst hold is not, so the
-         * fault timeout tracks the waveform length (see BURST_WAIT_TIMEOUT_MS). */
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_burst_chan, BURST_WAIT_TIMEOUT_MS));
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_hiZ_chan, BURST_WAIT_TIMEOUT_MS));
+         * fault timeout tracks the waveform length. */
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_burst_chan, s_wait_timeout_ms));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_hiZ_chan, s_wait_timeout_ms));
 
         vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
     }
@@ -226,10 +408,18 @@ void rmt_burst_task(void *arg)
 void app_main(void)
 {
     rmt_burst_init();
-    ESP_LOGI(TAG, " rmt burst init completed (%u pulses, %u ticks Hi-Z window, "
-                  "hold %u ticks at %u)",
-             (unsigned)PULSE_COUNT_PER_BURST, (unsigned)HIZ_LOW_TICKS,
-             (unsigned)BURST_HOLD_TICKS, (unsigned)BURST_HOLD_LEVEL);
+
+    const burst_config_t *cfg = &g_burst_cfg;
+    ESP_LOGI(TAG, " rmt burst init completed -- config \"%s\"", cfg->name);
+    ESP_LOGI(TAG, "   pulses on GPIO %d, Hi-Z gate on GPIO %d",
+             (int)cfg->burst_gpio, (int)cfg->hiz_gpio);
+    ESP_LOGI(TAG, "   %u pulses at %u Hz (%u symbols)",
+             (unsigned)cfg->pulse_count,
+             (unsigned)(cfg->resolution_hz / RMT_TICKS_PER_CYCLE),
+             (unsigned)s_burst_symbol_count);
+    ESP_LOGI(TAG, "   hold %u ticks at level %u, Hi-Z window %u ticks",
+             (unsigned)cfg->hold_ticks, (unsigned)cfg->hold_level,
+             (unsigned)cfg_hiZ_low_ticks(cfg));
 
     xTaskCreate(rmt_burst_task, "rmt_burst_task", 4096, NULL, 5, NULL);
     ESP_LOGI(TAG, " task started");
