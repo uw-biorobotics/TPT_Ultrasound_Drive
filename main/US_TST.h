@@ -45,7 +45,9 @@
  * low per cycle, this yields ~1.818182 MHz (+1.01% vs. the 1.8 MHz target --
  * closest achievable with an integer APB clock divider; confirmed acceptable for
  * this application). */
-#define RMT_RESOLUTION_HZ       3636364U
+#define N                       22         // can change to closeby values for freq tuning.
+// #define RMT_RESOLUTION_HZ       3636364U
+#define RMT_RESOLUTION_HZ       80000000U/N    // magic number for RMT output freq.
 #define PULSE_COUNT_PER_BURST   8     /* number of full square-wave cycles per burst */
 
 /* Post-burst hold: after the last pulse the burst line can either drop straight
