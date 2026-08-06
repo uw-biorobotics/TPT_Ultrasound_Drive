@@ -2,14 +2,14 @@
 """Draw the two RMT waveforms of US_TST.c with dimension lines for every
 burst_config_t field.
 
-The geometry here mirrors build_burst_symbols() / build_hiZ_symbols():
+The geometry here mirrors build_burst_symbols() / build_gate_symbols():
 
-    burst pin : 0 for hiz_lead_ticks
+    BURST pin : 0 for gate_lead_ticks
                 pulse_count x (1 tick high, 1 tick low)
                 hold_level for hold_ticks
                 0 (eot_level) afterwards
-    Hi-Z gate : STATE_LO_Z for lead + 2*pulse_count + hold + tail
-                STATE_HI_Z (init_level / eot_level) otherwise
+    GATE pin  : 0 (active) for lead + 2*pulse_count + hold + tail
+                1 (resting; init_level / eot_level) otherwise
 
 Both channels are released by the RMT TX sync manager, so t = 0 is the same
 clock edge on both pins.
@@ -27,7 +27,7 @@ from matplotlib.patches import Rectangle
 
 # ---------------------------------------------------------------- palette --
 C_BURST = "#1f6feb"   # pulse train
-C_GATE  = "#d1731a"   # Hi-Z gate
+C_GATE  = "#d1731a"   # gate
 INK     = "#1c1c1e"
 INK2    = "#55555c"
 MUTED   = "#9a9aa2"
@@ -44,47 +44,47 @@ CONFIGS = {
     # sized so each dimension line has room. This is the parameter drawing.
     "illustrative": dict(
         name="illustrative (all fields non-zero)",
-        burst_gpio=9, hiz_gpio=10,
+        burst_gpio=9, gate_gpio=10,
         resolution_hz=3636364,
         pulse_count=6,
         hold_level=1, hold_ticks=8,
-        hiz_lead_ticks=4, hiz_tail_ticks=4,
+        gate_lead_ticks=4, gate_tail_ticks=4,
     ),
     # ACTIVE_CONFIG in main/US_TST.c.
     "long-hold": dict(
         name="long-hold  (ACTIVE_CONFIG)",
-        burst_gpio=9, hiz_gpio=10,
+        burst_gpio=9, gate_gpio=10,
         resolution_hz=3636364,
         pulse_count=8,
         hold_level=1, hold_ticks=181,
-        hiz_lead_ticks=0, hiz_tail_ticks=0,
+        gate_lead_ticks=0, gate_tail_ticks=0,
     ),
     "guarded": dict(
         name="guarded",
-        burst_gpio=9, hiz_gpio=10,
+        burst_gpio=9, gate_gpio=10,
         resolution_hz=3636364,
         pulse_count=8,
         hold_level=1, hold_ticks=2,
-        hiz_lead_ticks=4, hiz_tail_ticks=4,
+        gate_lead_ticks=4, gate_tail_ticks=4,
     ),
     "no-hold": dict(
         name="no-hold",
-        burst_gpio=9, hiz_gpio=10,
+        burst_gpio=9, gate_gpio=10,
         resolution_hz=3636364,
         pulse_count=8,
         hold_level=0, hold_ticks=0,
-        hiz_lead_ticks=0, hiz_tail_ticks=0,
+        gate_lead_ticks=0, gate_tail_ticks=0,
     ),
 }
 
 
 def edges(cfg):
     """Tick numbers of the boundaries in the waveform."""
-    lead = cfg["hiz_lead_ticks"]
+    lead = cfg["gate_lead_ticks"]
     burst = cfg["pulse_count"] * RMT_TICKS_PER_CYCLE
     e = dict(t0=0, burst_start=lead, burst_end=lead + burst,
              hold_end=lead + burst + cfg["hold_ticks"], burst_ticks=burst)
-    e["tail_end"] = e["hold_end"] + cfg["hiz_tail_ticks"]
+    e["tail_end"] = e["hold_end"] + cfg["gate_tail_ticks"]
     return e
 
 
@@ -188,7 +188,7 @@ def draw_main(ax, cfg, e, us):
     # ---- identification, in the left gutter ------------------------------
     ax.text(-pre, B_HI + 0.55, f"BURST  ·  burst_gpio = GPIO {cfg['burst_gpio']}",
             fontsize=11.5, color=C_BURST, fontweight="bold", va="bottom")
-    ax.text(-pre, G_HI + 0.55, f"HI-Z GATE  ·  hiz_gpio = GPIO {cfg['hiz_gpio']}",
+    ax.text(-pre, G_HI + 0.55, f"GATE  ·  gate_gpio = GPIO {cfg['gate_gpio']}",
             fontsize=11.5, color=C_GATE, fontweight="bold", va="bottom")
     for y, lab in ((B_HI, "1"), (B_LO, "0"), (G_HI, "1"), (G_LO, "0")):
         ax.text(-pre - 0.012 * span, y, lab, fontsize=9, color=MUTED,
@@ -200,13 +200,13 @@ def draw_main(ax, cfg, e, us):
     ax.text(e["tail_end"] + post * 0.55, B_LO - 0.35,
             "rests low\nflags.eot_level = 0",
             fontsize=8.5, color=INK2, ha="center", va="top")
-    ax.text(-pre * 0.5, G_HI - 0.35, "STATE_HI_Z = 1\ninit_level",
+    ax.text(-pre * 0.5, G_HI - 0.35, "idles high\nflags.init_level = 1",
             fontsize=8.5, color=INK2, ha="center", va="top")
     ax.text(e["tail_end"] + post * 0.55, G_HI - 0.35,
-            "STATE_HI_Z = 1\neot_level", fontsize=8.5, color=INK2,
+            "rests high\nflags.eot_level = 1", fontsize=8.5, color=INK2,
             ha="center", va="top")
     ax.text(e["tail_end"] / 2, G_LO - 0.4,
-            "STATE_LO_Z = 0   —   driver enabled for this whole window",
+            "gate active (0)   —   driver enabled for this whole window",
             fontsize=9, color=C_GATE, ha="center", va="top")
 
     if cfg["hold_ticks"]:
@@ -237,27 +237,27 @@ def draw_main(ax, cfg, e, us):
 
     # ---- dimensions below the gate ---------------------------------------
     d1, d2 = 0.0, -2.0
-    if cfg["hiz_lead_ticks"]:
-        dim(ax, 0, e["burst_start"], d1, f"hiz_lead_ticks = {cfg['hiz_lead_ticks']}",
-            sub=f"{us(cfg['hiz_lead_ticks']):.2f} µs", color=C_GATE, above=False,
-            outside=cfg["hiz_lead_ticks"] / span < 0.10)
+    if cfg["gate_lead_ticks"]:
+        dim(ax, 0, e["burst_start"], d1, f"gate_lead_ticks = {cfg['gate_lead_ticks']}",
+            sub=f"{us(cfg['gate_lead_ticks']):.2f} µs", color=C_GATE, above=False,
+            outside=cfg["gate_lead_ticks"] / span < 0.10)
     else:
-        ax.annotate("hiz_lead_ticks = 0\ngate falls with the first pulse",
+        ax.annotate("gate_lead_ticks = 0\ngate falls with the first pulse",
                     xy=(0, G_LO), xytext=(-pre * 0.52, d1 - 0.5),
                     fontsize=8.5, color=C_GATE, ha="center", va="center",
                     arrowprops=dict(arrowstyle="->", color=C_GATE, lw=0.9))
-    if cfg["hiz_tail_ticks"]:
-        dim(ax, e["hold_end"], e["tail_end"], d1, f"hiz_tail_ticks = {cfg['hiz_tail_ticks']}",
-            sub=f"{us(cfg['hiz_tail_ticks']):.2f} µs", color=C_GATE, above=False,
-            outside=cfg["hiz_tail_ticks"] / span < 0.10)
+    if cfg["gate_tail_ticks"]:
+        dim(ax, e["hold_end"], e["tail_end"], d1, f"gate_tail_ticks = {cfg['gate_tail_ticks']}",
+            sub=f"{us(cfg['gate_tail_ticks']):.2f} µs", color=C_GATE, above=False,
+            outside=cfg["gate_tail_ticks"] / span < 0.10)
     else:
-        ax.annotate("hiz_tail_ticks = 0\ngate rises when the hold ends",
+        ax.annotate("gate_tail_ticks = 0\ngate rises when the hold ends",
                     xy=(e["tail_end"], G_LO), xytext=(e["tail_end"] + post * 0.52, d1 - 0.5),
                     fontsize=8.5, color=C_GATE, ha="center", va="center",
                     arrowprops=dict(arrowstyle="->", color=C_GATE, lw=0.9))
 
     dim(ax, 0, e["tail_end"], d2,
-        f"cfg_hiZ_low_ticks() = lead + 2*pulse_count + hold + tail = {e['tail_end']} ticks",
+        f"cfg_gate_active_ticks() = lead + 2*pulse_count + hold + tail = {e['tail_end']} ticks",
         sub=f"{us(e['tail_end']):.2f} µs   —   the length of one round, and the basis of "
             f"s_wait_timeout_ms", color=INK, above=False)
 
@@ -331,13 +331,13 @@ def draw_fields(ax, cfg, tick_us):
     rows = [
         ("name",           f'"{cfg["name"].split("  ")[0]}"',  "boot-log label only"),
         ("burst_gpio",     f"GPIO {cfg['burst_gpio']}",        "pin carrying the pulse train"),
-        ("hiz_gpio",       f"GPIO {cfg['hiz_gpio']}",          "pin carrying the Hi-Z gate"),
+        ("gate_gpio",       f"GPIO {cfg['gate_gpio']}",          "pin carrying the gate"),
         ("resolution_hz",  f"{cfg['resolution_hz']:,}",        f"1 tick = {tick_us:.4f} µs"),
         ("pulse_count",    f"{cfg['pulse_count']}",            "full cycles, 2 ticks each"),
         ("hold_level",     f"{cfg['hold_level']}",             "level parked after the last pulse"),
         ("hold_ticks",     f"{cfg['hold_ticks']}",             "length of that park; 0 = none"),
-        ("hiz_lead_ticks", f"{cfg['hiz_lead_ticks']}",         "gate leads the first pulse"),
-        ("hiz_tail_ticks", f"{cfg['hiz_tail_ticks']}",         "gate lags the end of the hold"),
+        ("gate_lead_ticks", f"{cfg['gate_lead_ticks']}",         "gate leads the first pulse"),
+        ("gate_tail_ticks", f"{cfg['gate_tail_ticks']}",         "gate lags the end of the hold"),
     ]
     ax.set_facecolor(SURFACE)
     ax.set_axis_off()
@@ -374,8 +374,8 @@ def draw(cfg, path):
     draw_repetition(fig.add_axes([0.375, 0.07, 0.24, 0.24]), us, e["tail_end"])
     draw_fields(fig.add_axes([0.675, 0.055, 0.295, 0.26]), cfg, tick_us)
 
-    fig.legend(handles=[Line2D([], [], color=C_BURST, lw=2.4, label="burst pin"),
-                        Line2D([], [], color=C_GATE, lw=2.4, label="Hi-Z gate pin")],
+    fig.legend(handles=[Line2D([], [], color=C_BURST, lw=2.4, label="BURST pin"),
+                        Line2D([], [], color=C_GATE, lw=2.4, label="GATE pin")],
                loc="upper right", bbox_to_anchor=(0.97, 0.995), frameon=False,
                ncol=2, fontsize=10)
     fig.text(0.055, 0.018,
