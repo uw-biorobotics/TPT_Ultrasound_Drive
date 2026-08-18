@@ -1,4 +1,9 @@
 #include "US_TST.h"
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/rmt_tx.h"
@@ -6,11 +11,16 @@
 
 /*  This code generates two waveforms from the ESP32-S3:
  *   1) BURST -- a series of pulse_count pulses at ~1.8 MHz, optionally followed
- *      by a hold at hold_level
+ *      by a hold at burst_hold_level
  *   2) GATE -- an enabling signal, an envelope around the burst: held at its
- *      active level for the pulses and the hold, idle otherwise. In the usual
- *      wiring it gates a line driver into a high-impedance state so the crystal
- *      can ring freely; see the header for the other wiring.
+ *      active level for the pulses, at gate_hold_level for the hold, idle
+ *      otherwise. In the usual wiring it gates a line driver into a
+ *      high-impedance state so the crystal can ring freely; see the header for
+ *      the other wiring.
+ *
+ *  Both hold levels are absolute logic levels, unaffected by either signal's
+ *  polarity: a hold level of GPIO_HIGH drives that pin high during the hold,
+ *  whatever its active level is.
  *
  *  Which logic level is "active" is a per-signal choice made by the preset
  *  (burst_active_level / gate_active_level), so neither signal is tied to a rail:
@@ -19,7 +29,7 @@
  *  set_gate_active() resolve those flags into the level pairs that the symbol
  *  tables and the channel configs are then built from.
  *
- *  The numbers come from the active burst_config_t -- see the cfg_* presets and
+ *  The numbers come from the active signals_config_t -- see the cfg_* presets and
  *  ACTIVE_CONFIG immediately below.
  *
  *  The two waveforms must be aligned in time precisely. An earlier version drove
@@ -55,7 +65,7 @@ static const char *TAG = "rmt_burst test";
  *
  * Only one is referenced per build, so the others would otherwise draw
  * "defined but not used" warnings. */
-#define PRESET  static const burst_config_t __attribute__((unused))
+// #define signals_config_t  static const signals_config_t __attribute__((unused))
 
 /*
  *  showing the struct for reference:
@@ -67,15 +77,16 @@ static const char *TAG = "rmt_burst test";
 //    uint32_t    resolution_hz;    /* RMT tick rate; pulse freq = this / RMT_TICKS_PER_CYCLE */
 //    uint16_t        pulse_count;        /* full square-wave cycles per burst */
 //    output_level_t  burst_active_level; /* level the pulses drive to */
-//    output_level_t  gate_active_level;  /* level the gate holds for its window */
-//    uint8_t         hold_level;         /* park the burst pin active (1) or idle (0) */
+//    output_level_t  gate_active_level;  /* level the gate holds for lead-in, pulses, tail */
+//    output_level_t  burst_hold_level;   /* level the burst pin is driven to during the hold */
+//    output_level_t  gate_hold_level;    /* level the gate pin is driven to during the hold */
 //    uint32_t        hold_ticks;         /* duration of that hold; 0 = none */
 //    uint32_t        gate_lead_ticks;    /* gate leads the first pulse by this much */
 //    uint32_t        gate_tail_ticks;    /* gate lags the end of the hold by this much */
-// } burst_config_t;
+// } signals_config_t;
 
 
-PRESET cfg_default = {                 /* whatever the #defines in US_TST.h say */
+signals_config_t cfg_default = {                 /* whatever the #defines in US_TST.h say */
     .name               = "default",
     .burst_gpio         = GPIO_BURST,
     .gate_gpio          = GPIO_GATE,
@@ -83,13 +94,14 @@ PRESET cfg_default = {                 /* whatever the #defines in US_TST.h say 
     .pulse_count        = PULSE_COUNT_PER_BURST,
     .burst_active_level = BURST_ACTIVE_LEVEL,
     .gate_active_level  = GATE_ACTIVE_LEVEL,
-    .hold_level         = POST_BURST_HOLD_LEVEL,
-    .hold_ticks         = POST_BURST_HOLD_TICKS,
+    .burst_hold_level   = BURST_HOLD_LEVEL,
+    .gate_hold_level    = GATE_HOLD_LEVEL,
+    .hold_ticks         = HOLD_TICKS,
     .gate_lead_ticks    = GATE_LEAD_TICKS,
     .gate_tail_ticks    = GATE_TAIL_TICKS,
 };
 
-PRESET cfg_no_hold = {                 /* original behaviour: idle right after the burst */
+signals_config_t cfg_no_hold = {                 /* original behaviour: idle right after the burst */
     .name               = "no-hold",
     .burst_gpio         = GPIO_NUM_9,
     .gate_gpio          = GPIO_NUM_10,
@@ -97,11 +109,12 @@ PRESET cfg_no_hold = {                 /* original behaviour: idle right after t
     .pulse_count        = 8,
     .burst_active_level = GPIO_HIGH,
     .gate_active_level  = GPIO_LOW,
-    .hold_level         = 0,
+    .burst_hold_level   = GPIO_LOW,    /* unused: hold_ticks is 0 */
+    .gate_hold_level    = GPIO_LOW,    /* unused: hold_ticks is 0 */
     .hold_ticks         = 0,
 };
 
-PRESET cfg_long_hold = {               /* 50 us hold -- easy to see on a slow timebase */
+signals_config_t cfg_long_hold = {               /* 10 us hold -- easy to see on a slow timebase */
     .name               = "long-hold",
     .burst_gpio         = GPIO_NUM_9,
     .gate_gpio          = GPIO_NUM_10,
@@ -109,11 +122,26 @@ PRESET cfg_long_hold = {               /* 50 us hold -- easy to see on a slow ti
     .pulse_count        = 8,
     .burst_active_level = GPIO_HIGH,
     .gate_active_level  = GPIO_LOW,
-    .hold_level         = 1,
-    .hold_ticks         = TICKS_FROM_US_AT(50, 3636364U),   /* 181 ticks */
+    .burst_hold_level   = GPIO_HIGH,   /* burst held high after the pulses */
+    .gate_hold_level    = GPIO_LOW,    /* gate stays asserted through the hold */
+    .hold_ticks         = TICKS_FROM_US_AT(10, 3636364U),   /* 36 ticks */
 };
 
-PRESET cfg_max_burst = {               /* longest burst that fits in one RMT memory block */
+
+signals_config_t cfg_long_hold_BAR = {           /* cfg_long_hold with both polarities flipped */
+    .name               = "long-hold-BAR",
+    .burst_gpio         = GPIO_NUM_9,
+    .gate_gpio          = GPIO_NUM_10,
+    .resolution_hz      = 3636364U,
+    .pulse_count        = 8,
+    .burst_active_level = GPIO_LOW,
+    .gate_active_level  = GPIO_HIGH,
+    .burst_hold_level   = GPIO_LOW,    /* burst held low after the pulses */
+    .gate_hold_level    = GPIO_HIGH,   /* gate stays asserted through the hold */
+    .hold_ticks         = TICKS_FROM_US_AT(10, 3636364U),   /* 36 ticks */
+};
+
+signals_config_t cfg_max_burst = {               /* longest burst that fits in one RMT memory block */
     .name               = "max-burst",
     .burst_gpio         = GPIO_NUM_9,
     .gate_gpio          = GPIO_NUM_10,
@@ -121,11 +149,12 @@ PRESET cfg_max_burst = {               /* longest burst that fits in one RMT mem
     .pulse_count        = 46,          /* 47 symbols available, 1 spent on the hold */
     .burst_active_level = GPIO_HIGH,
     .gate_active_level  = GPIO_LOW,
-    .hold_level         = 1,
+    .burst_hold_level   = GPIO_HIGH,
+    .gate_hold_level    = GPIO_LOW,
     .hold_ticks         = 4,
 };
 
-PRESET cfg_guarded = {                 /* guard bands on both ends, to check gate alignment */
+signals_config_t cfg_guarded = {                 /* guard bands on both ends, to check gate alignment */
     .name               = "guarded",
     .burst_gpio         = GPIO_NUM_9,
     .gate_gpio          = GPIO_NUM_10,
@@ -133,17 +162,37 @@ PRESET cfg_guarded = {                 /* guard bands on both ends, to check gat
     .pulse_count        = 8,
     .burst_active_level = GPIO_HIGH,
     .gate_active_level  = GPIO_LOW,
-    .hold_level         = 1,
+    .burst_hold_level   = GPIO_HIGH,
+    .gate_hold_level    = GPIO_LOW,
     .hold_ticks         = 2,
     .gate_lead_ticks    = 4,
     .gate_tail_ticks    = 4,
 };
 
+
+signals_config_t Mode_B = {               /* DC '1' to drive input, pulses to gate */
+    .name               = "ReverseDrive",
+    .burst_gpio         = GPIO_NUM_9,
+    .gate_gpio          = GPIO_NUM_10,
+    .resolution_hz      = 3636364U,
+    .pulse_count        = 8,
+    .burst_active_level = GPIO_HIGH,
+    .gate_active_level  = GPIO_HIGH,
+    .burst_hold_level   = GPIO_LOW,    /* burst pulled low after the pulses */
+    .gate_hold_level    = GPIO_LOW,    /* gate stays asserted through the hold */
+    .hold_ticks         = 0,           /* 2 is the shortest hold emit_level() can express */
+};
+
+
 /* >>> The one edit that switches configurations. <<< */
 // #define ACTIVE_CONFIG   cfg_default
-#define ACTIVE_CONFIG   cfg_long_hold
+// #define ACTIVE_CONFIG   cfg_long_hold
+#define ACTIVE_CONFIG   Mode_B
 
-burst_config_t g_burst_cfg;   /* the live config; loaded by rmt_burst_init() */
+/* The live config. ACTIVE_CONFIG names a *variable*, so it cannot initialize
+ * another object at file scope (C requires a constant expression there);
+ * rmt_burst_init() copies it in at startup instead. */
+signals_config_t  g_burst_cfg;
 
 /* -------------------------------------------------------------------- */
 /* State                                                                 */
@@ -173,6 +222,113 @@ static size_t            s_gate_symbol_count;
  * rmt_burst_init(). A long post-burst hold can outlast a fixed timeout. */
 static int               s_wait_timeout_ms;
 
+/* Set by rmt_burst_task() around its own lifetime, read by fault_task() to report
+ * whether the waveform task has actually stopped yet. A flag rather than a task
+ * handle: the task owns it, so there is no window where it has already exited but
+ * the handle has not been stored yet. */
+static volatile bool s_burst_running;
+
+static TaskHandle_t  s_fault_task = NULL;
+
+/* -------------------------------------------------------------------- */
+/* Fault reporting                                                       */
+/* -------------------------------------------------------------------- */
+
+/* Nothing here aborts. ESP_ERROR_CHECK used to turn a rejected preset into a
+ * panic, so the one line that said what was actually wrong scrolled past in a
+ * reboot loop while both pins sat dead. Instead the first failure is recorded
+ * below, waveform generation stops, and fault_task() repeats the reason every
+ * FAULT_REPORT_PERIOD_MS for as long as the board is powered.
+ *
+ * s_faulted is the stop flag every waveform task polls, so adding a task later
+ * means adding one `while (!s_faulted)` rather than another shutdown path. */
+static volatile bool s_faulted;             /* set once, never cleared */
+static esp_err_t     s_fault_err;           /* the esp_err_t that started it */
+static const char   *s_fault_where = "";    /* the call or check that produced it */
+static char          s_fault_detail[128];   /* validate_config()'s specific complaint */
+
+/* The human-readable half of a validation failure. Stored rather than logged on
+ * the spot so the 3-second report can keep repeating it. */
+static void __attribute__((format(printf, 1, 2)))
+fault_set_detail(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_fault_detail, sizeof(s_fault_detail), fmt, ap);
+    va_end(ap);
+}
+
+/* Repeats the recorded fault forever. Deliberately three short lines rather than
+ * one long one, so it stays readable when it reappears every few seconds. */
+static void fault_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        ESP_LOGE(TAG, "FAULT: %s (0x%x) from %s",
+                 esp_err_to_name(s_fault_err), (unsigned)s_fault_err, s_fault_where);
+        if (s_fault_detail[0] != '\0') {
+            ESP_LOGE(TAG, "FAULT: config \"%s\": %s", g_burst_cfg.name, s_fault_detail);
+        }
+        if (s_burst_running) {
+            ESP_LOGE(TAG, "FAULT: waiting for rmt_burst_task to finish its round and stop");
+        } else {
+            ESP_LOGE(TAG, "FAULT: no BURST or GATE output -- fix the preset in US_TST.c and reflash");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(FAULT_REPORT_PERIOD_MS));
+    }
+}
+
+/* Record a failure and start reporting it. Safe to call from any task and from
+ * app_main. Only the first call is kept: a cascade of later failures is a
+ * consequence of the first, and overwriting it would hide the actual cause. */
+static void fault_raise(esp_err_t err, const char *where)
+{
+    if (s_faulted) {
+        ESP_LOGE(TAG, "further failure after fault: %s from %s",
+                 esp_err_to_name(err), where);
+        return;
+    }
+
+    s_fault_err   = err;
+    s_fault_where = where;
+    s_faulted     = true;      /* stops rmt_burst_task()'s loop */
+
+    /* Lower priority than the burst task, so this cannot preempt a transmission
+     * that is still winding down. */
+    if (xTaskCreate(fault_task, "fault_task", 3072, NULL, 4, &s_fault_task) != pdPASS) {
+        s_fault_task = NULL;
+        ESP_LOGE(TAG, "FAULT: %s from %s (could not start fault_task)",
+                 esp_err_to_name(err), where);
+        if (s_fault_detail[0] != '\0') {
+            ESP_LOGE(TAG, "FAULT: config \"%s\": %s", g_burst_cfg.name, s_fault_detail);
+        }
+    }
+}
+
+/* Replaces ESP_ERROR_CHECK in functions that can return an esp_err_t: report the
+ * failure with the failing call as its origin, then unwind. */
+#define TRY_OR_FAULT(call)                                                     \
+    do {                                                                       \
+        esp_err_t err_ = (call);                                               \
+        if (err_ != ESP_OK) {                                                  \
+            fault_raise(err_, #call);                                          \
+            return err_;                                                       \
+        }                                                                      \
+    } while (0)
+
+/* Same idea for rmt_burst_task(), which returns nothing and has to break out of
+ * its loop instead. */
+static bool step_ok(esp_err_t err, const char *where)
+{
+    if (err == ESP_OK) {
+        return true;
+    }
+    fault_raise(err, where);
+    return false;
+}
+
 /* -------------------------------------------------------------------- */
 /* Signal polarity                                                       */
 /* -------------------------------------------------------------------- */
@@ -188,39 +344,44 @@ static int               s_wait_timeout_ms;
 static unsigned s_burst_active, s_burst_idle;
 static unsigned s_gate_active,  s_gate_idle;
 
+/* The one place an output_level_t becomes the bit an RMT symbol carries. */
+static unsigned level_bit(output_level_t level)
+{
+    return (level == GPIO_HIGH) ? 1u : 0u;
+}
+
 static void set_burst_active(output_level_t level)
 {
-    s_burst_active = (level == GPIO_HIGH) ? 1u : 0u;
+    s_burst_active = level_bit(level);
     s_burst_idle   = 1u - s_burst_active;
 }
 
 static void set_gate_active(output_level_t level)
 {
-    s_gate_active = (level == GPIO_HIGH) ? 1u : 0u;
+    s_gate_active = level_bit(level);
     s_gate_idle   = 1u - s_gate_active;
 }
 
-/* The level the post-burst hold parks the burst pin at. hold_level is relative to
- * the burst's polarity rather than absolute: 1 parks active, 0 parks idle, so a
- * preset keeps its meaning when its polarity is flipped. */
-static unsigned burst_hold_level(const burst_config_t *cfg)
-{
-    return cfg->hold_level ? s_burst_active : s_burst_idle;
-}
+/* The hold levels need no resolving: burst_hold_level and gate_hold_level are
+ * absolute logic levels, independent of either signal's polarity, so they go
+ * straight through level_bit() wherever they are used. A preset that wants a
+ * signal to stay active through the hold says so by giving its hold level the
+ * same value as its active level. */
 
 /* -------------------------------------------------------------------- */
 /* Derived quantities                                                    */
 /* -------------------------------------------------------------------- */
 
 /* Ticks the pulses themselves occupy. */
-static uint32_t cfg_burst_ticks(const burst_config_t *cfg)
+static uint32_t cfg_burst_ticks(const signals_config_t *cfg)
 {
     return (uint32_t)cfg->pulse_count * RMT_TICKS_PER_CYCLE;
 }
 
-/* The gate's active window: lead-in + pulses + hold + tail. This is also the
- * total length of a round, so the wait timeout is computed from it. */
-static uint32_t cfg_gate_active_ticks(const burst_config_t *cfg)
+/* The whole round: lead-in + pulses + hold + tail. Both waveforms span exactly
+ * this many ticks, which is what keeps them aligned, and the wait timeout is
+ * computed from it. */
+static uint32_t cfg_total_ticks(const signals_config_t *cfg)
 {
     return cfg->gate_lead_ticks + cfg_burst_ticks(cfg) +
            cfg->hold_ticks + cfg->gate_tail_ticks;
@@ -233,10 +394,21 @@ static uint32_t ticks_to_symbols(uint32_t ticks)
 }
 
 /* Symbols the burst waveform occupies: lead-in + one per cycle + hold. */
-static uint32_t cfg_burst_symbols(const burst_config_t *cfg)
+static uint32_t cfg_burst_symbols(const signals_config_t *cfg)
 {
     return ticks_to_symbols(cfg->gate_lead_ticks) + cfg->pulse_count +
            ticks_to_symbols(cfg->hold_ticks);
+}
+
+/* Symbols the gate waveform occupies. It is three runs of steady level rather
+ * than one, since the hold can sit at a different level from the rest of the
+ * window, and each run needs at least one symbol of its own. Mirrors
+ * build_gate_symbols(). */
+static uint32_t cfg_gate_symbols(const signals_config_t *cfg)
+{
+    return ticks_to_symbols(cfg->gate_lead_ticks + cfg_burst_ticks(cfg)) +
+           ticks_to_symbols(cfg->hold_ticks) +
+           ticks_to_symbols(cfg->gate_tail_ticks);
 }
 
 /* -------------------------------------------------------------------- */
@@ -244,15 +416,18 @@ static uint32_t cfg_burst_symbols(const burst_config_t *cfg)
 /* -------------------------------------------------------------------- */
 
 /* What the _Static_asserts used to cover, now that the values arrive at runtime.
- * Called before anything is built, and its result is ESP_ERROR_CHECK'd, so a bad
- * preset stops the boot with a named reason rather than emitting a broken
- * waveform. */
-static esp_err_t validate_config(const burst_config_t *cfg)
+ * Called before anything is built, so a bad preset stops the boot with a named
+ * reason rather than emitting a broken waveform.
+ *
+ * The reason goes into s_fault_detail rather than straight to the log: the caller
+ * turns the returned error into a fault, and fault_task() then repeats the reason
+ * every few seconds instead of it appearing once and scrolling away. */
+static esp_err_t validate_config(const signals_config_t *cfg)
 {
 #define CFG_REQUIRE(cond, fmt, ...)                                            \
     do {                                                                       \
         if (!(cond)) {                                                         \
-            ESP_LOGE(TAG, "config \"%s\": " fmt, cfg->name, ##__VA_ARGS__);    \
+            fault_set_detail(fmt, ##__VA_ARGS__);                              \
             return ESP_ERR_INVALID_ARG;                                        \
         }                                                                      \
     } while (0)
@@ -272,8 +447,6 @@ static esp_err_t validate_config(const burst_config_t *cfg)
                 "resolution_hz %u is below 1 kHz", (unsigned)cfg->resolution_hz);
     CFG_REQUIRE(cfg->pulse_count >= 1,
                 "pulse_count is 0");
-    CFG_REQUIRE(cfg->hold_level <= 1,
-                "hold_level %u is not 0 or 1", (unsigned)cfg->hold_level);
 
     /* Catches a stray cast or a value that outgrew output_level_t; a preset that
      * simply omits the field is caught by neither, which is why they are all
@@ -284,6 +457,12 @@ static esp_err_t validate_config(const burst_config_t *cfg)
     CFG_REQUIRE(cfg->gate_active_level == GPIO_LOW || cfg->gate_active_level == GPIO_HIGH,
                 "gate_active_level %u is not GPIO_LOW or GPIO_HIGH",
                 (unsigned)cfg->gate_active_level);
+    CFG_REQUIRE(cfg->burst_hold_level == GPIO_LOW || cfg->burst_hold_level == GPIO_HIGH,
+                "burst_hold_level %u is not GPIO_LOW or GPIO_HIGH",
+                (unsigned)cfg->burst_hold_level);
+    CFG_REQUIRE(cfg->gate_hold_level == GPIO_LOW || cfg->gate_hold_level == GPIO_HIGH,
+                "gate_hold_level %u is not GPIO_LOW or GPIO_HIGH",
+                (unsigned)cfg->gate_hold_level);
 
     /* A duration field of 0 is the end-of-transmission marker, and emit_level()
      * splits a run across two halves, so a lone tick cannot be expressed. */
@@ -299,9 +478,9 @@ static esp_err_t validate_config(const burst_config_t *cfg)
     CFG_REQUIRE(cfg_burst_symbols(cfg) <= BURST_SYMBOLS_MAX,
                 "burst needs %u symbols, only %u fit in one RMT memory block",
                 (unsigned)cfg_burst_symbols(cfg), (unsigned)BURST_SYMBOLS_MAX);
-    CFG_REQUIRE(ticks_to_symbols(cfg_gate_active_ticks(cfg)) <= BURST_SYMBOLS_MAX,
+    CFG_REQUIRE(cfg_gate_symbols(cfg) <= BURST_SYMBOLS_MAX,
                 "gate window needs %u symbols, only %u fit in one RMT memory block",
-                (unsigned)ticks_to_symbols(cfg_gate_active_ticks(cfg)),
+                (unsigned)cfg_gate_symbols(cfg),
                 (unsigned)BURST_SYMBOLS_MAX);
 
 #undef CFG_REQUIRE
@@ -350,7 +529,7 @@ static size_t emit_level(rmt_symbol_word_t *dst, unsigned level, uint32_t ticks)
  * its idle level via the transmit config's eot_level.
  *
  * Requires set_burst_active() to have been called. */
-static void build_burst_symbols(const burst_config_t *cfg)
+static void build_burst_symbols(const signals_config_t *cfg)
 {
     size_t n = 0;
 
@@ -365,31 +544,50 @@ static void build_burst_symbols(const burst_config_t *cfg)
         n++;
     }
 
-    /* Park the line for the programmed hold, if any. */
-    n += emit_level(&s_burst_symbols[n], burst_hold_level(cfg), cfg->hold_ticks);
+    /* Hold the line at the programmed level, if there is a hold at all. */
+    n += emit_level(&s_burst_symbols[n], level_bit(cfg->burst_hold_level), cfg->hold_ticks);
 
     s_burst_symbol_count = n;
 }
 
-/* GATE on cfg->gate_gpio: hold the gate at its active level for the whole window
- * -- lead-in, burst and post-burst hold. The line returns to its idle level via
- * the transmit config's eot_level.
+/* GATE on cfg->gate_gpio: active for the lead-in and the pulses, then at
+ * cfg->gate_hold_level for the post-burst hold, then active again for the tail.
+ * The line returns to its idle level via the transmit config's eot_level.
+ *
+ * With gate_hold_level equal to gate_active_level -- what every preset here does
+ * -- all three runs are the same level and the gate is simply asserted for the
+ * whole window, as it was before the hold level became settable.
+ *
+ * Spans the same total ticks as the burst waveform, so the two stay aligned.
  *
  * Requires set_gate_active() to have been called. */
-static void build_gate_symbols(const burst_config_t *cfg)
+static void build_gate_symbols(const signals_config_t *cfg)
 {
-    s_gate_symbol_count =
-        emit_level(s_gate_symbols, s_gate_active, cfg_gate_active_ticks(cfg));
+    size_t n = 0;
+
+    /* Asserted from the start of the lead-in through the last pulse. */
+    n += emit_level(&s_gate_symbols[n], s_gate_active,
+                    cfg->gate_lead_ticks + cfg_burst_ticks(cfg));
+
+    /* Whatever level the preset asks for while the burst line is held. */
+    n += emit_level(&s_gate_symbols[n], level_bit(cfg->gate_hold_level), cfg->hold_ticks);
+
+    /* Asserted again for the trailing guard band. */
+    n += emit_level(&s_gate_symbols[n], s_gate_active, cfg->gate_tail_ticks);
+
+    s_gate_symbol_count = n;
 }
 
 /* -------------------------------------------------------------------- */
 /* RMT setup: two synchronized TX channels                               */
 /* -------------------------------------------------------------------- */
-void rmt_burst_init(void)
+esp_err_t rmt_burst_init(void)
 {
-    /* Copy the selected preset into the working config, then check it. */
+    /* Copy the selected preset into the working config, then check it. Every
+     * failure below returns instead of panicking, having first handed the reason
+     * to fault_raise(); see the fault reporting section above. */
     g_burst_cfg = ACTIVE_CONFIG;
-    ESP_ERROR_CHECK(validate_config(&g_burst_cfg));
+    TRY_OR_FAULT(validate_config(&g_burst_cfg));
 
     /* Resolve each signal's pair of levels first: everything after this -- both
      * symbol tables and both channels' idle level -- is built from them. */
@@ -401,7 +599,7 @@ void rmt_burst_init(void)
 
     /* The waveform's own length in ms, plus 10 ms of slack. */
     s_wait_timeout_ms =
-        (int)(cfg_gate_active_ticks(&g_burst_cfg) / (g_burst_cfg.resolution_hz / 1000U)) + 10;
+        (int)(cfg_total_ticks(&g_burst_cfg) / (g_burst_cfg.resolution_hz / 1000U)) + 10;
 
     /* Both channels must share clk_src and resolution_hz to be synchronizable. */
     rmt_tx_channel_config_t tx_chan_config = {
@@ -414,29 +612,31 @@ void rmt_burst_init(void)
         .flags.with_dma     = false,
         .flags.init_level   = s_burst_idle,   /* pulse line idles between bursts */
     };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &s_burst_chan));
+    TRY_OR_FAULT(rmt_new_tx_channel(&tx_chan_config, &s_burst_chan));
 
     /* Same config, gate pin, and idling so the driver chip is held off from the
      * moment the channel is created -- before the first transmission. */
     tx_chan_config.gpio_num         = g_burst_cfg.gate_gpio;
     tx_chan_config.flags.init_level = s_gate_idle;
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &s_gate_chan));
+    TRY_OR_FAULT(rmt_new_tx_channel(&tx_chan_config, &s_gate_chan));
 
     rmt_copy_encoder_config_t copy_encoder_config = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_encoder_config, &s_burst_encoder));
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_encoder_config, &s_gate_encoder));
+    TRY_OR_FAULT(rmt_new_copy_encoder(&copy_encoder_config, &s_burst_encoder));
+    TRY_OR_FAULT(rmt_new_copy_encoder(&copy_encoder_config, &s_gate_encoder));
 
     /* Channels must be enabled before joining the sync manager, otherwise
      * rmt_new_sync_manager() returns ESP_ERR_INVALID_STATE. */
-    ESP_ERROR_CHECK(rmt_enable(s_burst_chan));
-    ESP_ERROR_CHECK(rmt_enable(s_gate_chan));
+    TRY_OR_FAULT(rmt_enable(s_burst_chan));
+    TRY_OR_FAULT(rmt_enable(s_gate_chan));
 
     const rmt_channel_handle_t sync_channels[] = { s_burst_chan, s_gate_chan };
     rmt_sync_manager_config_t sync_config = {
         .tx_channel_array = sync_channels,
         .array_size       = sizeof(sync_channels) / sizeof(sync_channels[0]),
     };
-    ESP_ERROR_CHECK(rmt_new_sync_manager(&sync_config, &s_sync));
+    TRY_OR_FAULT(rmt_new_sync_manager(&sync_config, &s_sync));
+
+    return ESP_OK;
 }
 
 /* -------------------------------------------------------------------- */
@@ -444,6 +644,8 @@ void rmt_burst_init(void)
 /* -------------------------------------------------------------------- */
 void rmt_burst_task(void *arg)
 {
+    s_burst_running = true;
+
     rmt_transmit_config_t burst_tx_config = {
         .loop_count      = 0,              /* single-shot burst */
         .flags.eot_level = s_burst_idle,   /* pulse line rests idle */
@@ -454,38 +656,70 @@ void rmt_burst_task(void *arg)
         .flags.eot_level = s_gate_idle,    /* gate goes back to idle when the burst ends */
     };
 
-    while (1) {
+    /* Any step that fails raises the fault and breaks the loop; s_faulted also
+     * lets a fault raised anywhere else stop this task at the top of a round,
+     * never part-way through a burst. */
+    while (!s_faulted) {
         /* Pull both channels back to the starting line: resets each channel's
          * clock divider and memory read pointer. Without this, bursts after the
          * first lose their alignment. */
-        ESP_ERROR_CHECK(rmt_sync_reset(s_sync));
+        if (!step_ok(rmt_sync_reset(s_sync), "rmt_sync_reset()")) {
+            break;
+        }
 
         /* Neither channel actually starts until both have been armed, so the
          * order of these two calls and the gap between them do not matter. */
-        ESP_ERROR_CHECK(rmt_transmit(s_gate_chan, s_gate_encoder,
-                                     s_gate_symbols,
-                                     s_gate_symbol_count * sizeof(rmt_symbol_word_t),
-                                     &gate_tx_config));
-        ESP_ERROR_CHECK(rmt_transmit(s_burst_chan, s_burst_encoder,
-                                     s_burst_symbols,
-                                     s_burst_symbol_count * sizeof(rmt_symbol_word_t),
-                                     &burst_tx_config));
+        if (!step_ok(rmt_transmit(s_gate_chan, s_gate_encoder,
+                                  s_gate_symbols,
+                                  s_gate_symbol_count * sizeof(rmt_symbol_word_t),
+                                  &gate_tx_config),
+                     "rmt_transmit() on the gate channel")) {
+            break;
+        }
+        if (!step_ok(rmt_transmit(s_burst_chan, s_burst_encoder,
+                                  s_burst_symbols,
+                                  s_burst_symbol_count * sizeof(rmt_symbol_word_t),
+                                  &burst_tx_config),
+                     "rmt_transmit() on the burst channel")) {
+            break;
+        }
 
         /* Both must be idle before the next rmt_sync_reset(). The burst itself is
          * only a few microseconds, but a long post-burst hold is not, so the
          * fault timeout tracks the waveform length. */
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_burst_chan, s_wait_timeout_ms));
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_gate_chan, s_wait_timeout_ms));
+        if (!step_ok(rmt_tx_wait_all_done(s_burst_chan, s_wait_timeout_ms),
+                     "rmt_tx_wait_all_done() on the burst channel")) {
+            break;
+        }
+        if (!step_ok(rmt_tx_wait_all_done(s_gate_chan, s_wait_timeout_ms),
+                     "rmt_tx_wait_all_done() on the gate channel")) {
+            break;
+        }
 
         vTaskDelay(1);   /* block for exactly 1 OS tick before next burst */
     }
+
+    /* Stop driving both pins, then leave. fault_task() does the talking from
+     * here; this task must not linger, since a half-finished round would keep
+     * the peripheral busy while the reason is being reported. */
+    rmt_disable(s_burst_chan);
+    rmt_disable(s_gate_chan);
+
+    ESP_LOGE(TAG, "rmt_burst_task stopping; both channels disabled");
+
+    s_burst_running = false;
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    rmt_burst_init();
+    if (rmt_burst_init() != ESP_OK) {
+        /* fault_task() is already reporting the reason every few seconds, and
+         * neither pin is being driven. Nothing left for app_main to do. */
+        return;
+    }
 
-    const burst_config_t *cfg = &g_burst_cfg;
+    const signals_config_t *cfg = &g_burst_cfg;
     ESP_LOGI(TAG, " rmt burst init completed -- config \"%s\"", cfg->name);
     ESP_LOGI(TAG, "   BURST on GPIO %d, GATE on GPIO %d",
              (int)cfg->burst_gpio, (int)cfg->gate_gpio);
@@ -495,11 +729,18 @@ void app_main(void)
              (unsigned)s_burst_symbol_count);
     ESP_LOGI(TAG, "   BURST active %u / idle %u, GATE active %u / idle %u",
              s_burst_active, s_burst_idle, s_gate_active, s_gate_idle);
-    ESP_LOGI(TAG, "   hold %u ticks at level %u (%s), gate window %u ticks",
-             (unsigned)cfg->hold_ticks, burst_hold_level(cfg),
-             cfg->hold_level ? "active" : "idle",
-             (unsigned)cfg_gate_active_ticks(cfg));
+    ESP_LOGI(TAG, "   hold %u ticks: BURST at %u, GATE at %u",
+             (unsigned)cfg->hold_ticks,
+             level_bit(cfg->burst_hold_level), level_bit(cfg->gate_hold_level));
+    ESP_LOGI(TAG, "   round %u ticks (%u gate symbols)",
+             (unsigned)cfg_total_ticks(cfg), (unsigned)s_gate_symbol_count);
 
-    xTaskCreate(rmt_burst_task, "rmt_burst_task", 4096, NULL, 5, NULL);
+    /* No handle needed: the task stops itself on s_faulted and reports its own
+     * liveness through s_burst_running. */
+    if (xTaskCreate(rmt_burst_task, "rmt_burst_task", 4096, NULL, 5, NULL) != pdPASS) {
+        fault_raise(ESP_ERR_NO_MEM, "xTaskCreate(rmt_burst_task)");
+        return;
+    }
+
     ESP_LOGI(TAG, " task started");
 }

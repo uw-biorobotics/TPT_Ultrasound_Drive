@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#include "esp_err.h"       /* esp_err_t */
 #include "driver/gpio.h"   /* gpio_num_t, GPIO_NUM_*, GPIO_NUM_MAX */
 
 /* ---- The two output signals ----
@@ -32,7 +33,7 @@
 #define GPIO_GATE    GPIO_NUM_10   /* RMT ch B: gate/envelope, active during the burst */
 
 /* ---- Output levels ----
- * Used for the *_active_level flags in burst_config_t: the logic level a signal
+ * Used for the *_active_level flags in signals_config_t: the logic level a signal
  * is driven to while it is active. The idle level -- what the line sits at from
  * channel creation, between pulses, and after the burst -- is always the
  * complement, so setting the active level sets both.
@@ -79,24 +80,25 @@ typedef enum {
 #define RMT_RESOLUTION_HZ       80000000U/N    // magic number for RMT output freq.
 #define PULSE_COUNT_PER_BURST   8     /* number of full square-wave cycles per burst */
 
-/* Post-burst hold: after the last pulse the burst line can either fall straight
- * back to its idle level (POST_BURST_HOLD_TICKS == 0) or be parked for
- * POST_BURST_HOLD_TICKS first. The hold is emitted as extra symbols at the tail
- * of the burst waveform, and the gate stays active for its whole duration
- * (parking a level the driver is not actually driving would be pointless).
+/* Post-burst hold: after the last pulse both lines can either go straight back
+ * to their idle levels (HOLD_TICKS == 0) or be held at a chosen level for
+ * HOLD_TICKS first. One duration covers both signals, so they stay tick-aligned;
+ * the hold is emitted as extra symbols at the tail of each waveform.
  *
- * POST_BURST_HOLD_LEVEL is relative to the burst's polarity, not an absolute
- * logic level: 1 parks at the active level, 0 parks at the idle level. Under
- * POLARITY_ACTIVE_HIGH those are the literal 1 and 0, so this reads the same as
- * it always did; under POLARITY_ACTIVE_LOW it follows the inversion instead of
- * silently parking on the wrong rail. */
-#define POST_BURST_HOLD_LEVEL   1     /* 1 = park active, 0 = park idle */
-#define POST_BURST_HOLD_TICKS   4U    /* 0 = no hold; the line goes idle at once */
+ * Each signal has its own hold level, and both are *absolute* logic levels -- a
+ * hold level of GPIO_HIGH means the pin is driven high during the hold no matter
+ * what that signal's active level is. They are independent of *_ACTIVE_LEVEL, so
+ * changing a polarity leaves the hold exactly where it was written. To keep a
+ * signal at its active level through the hold (what the gate does by default),
+ * give it the same level as its *_ACTIVE_LEVEL. */
+#define BURST_HOLD_LEVEL        GPIO_HIGH  /* burst pin during the hold */
+#define GATE_HOLD_LEVEL         GPIO_LOW   /* gate pin during the hold; == GATE_ACTIVE_LEVEL */
+#define HOLD_TICKS              4U         /* 0 = no hold; both lines go idle at once */
 
-/* Gate guard bands. The gate is active for the whole burst and any post-burst
- * hold, plus these optional bands before and after. A non-zero lead also inserts
- * a matching idle symbol at the head of the burst waveform, so the two channels
- * stay tick-aligned. */
+/* Gate guard bands. The gate is active for the whole burst plus these optional
+ * bands before and after it; during the hold in between it sits at
+ * GATE_HOLD_LEVEL. A non-zero lead also inserts a matching idle symbol at the
+ * head of the burst waveform, so the two channels stay tick-aligned. */
 #define GATE_LEAD_TICKS         0U    /* ticks the gate leads the first pulse */
 #define GATE_TAIL_TICKS         0U    /* ticks the gate lags the end of the hold */
 
@@ -125,21 +127,35 @@ typedef struct {
     uint32_t        resolution_hz;      /* RMT tick rate; pulse freq = this / RMT_TICKS_PER_CYCLE */
     uint16_t        pulse_count;        /* full square-wave cycles per burst */
     output_level_t  burst_active_level; /* level the pulses drive to */
-    output_level_t  gate_active_level;  /* level the gate holds for its window */
-    uint8_t         hold_level;         /* park the burst pin active (1) or idle (0) after the pulses */
+    output_level_t  gate_active_level;  /* level the gate holds for the lead-in, pulses and tail */
+    output_level_t  burst_hold_level;   /* level the burst pin is driven to during the hold */
+    output_level_t  gate_hold_level;    /* level the gate pin is driven to during the hold */
     uint32_t        hold_ticks;         /* duration of that hold; 0 = none */
     uint32_t        gate_lead_ticks;    /* gate leads the first pulse by this much */
     uint32_t        gate_tail_ticks;    /* gate lags the end of the hold by this much */
-} burst_config_t;
+} signals_config_t;
 
 /* The live configuration: a copy of the selected preset, taken by
  * rmt_burst_init(). Exposed so it can be inspected from a debugger; changing it
  * after init has no effect, since the symbol tables and the channels are built
  * from it once. */
-extern burst_config_t g_burst_cfg;
+extern signals_config_t g_burst_cfg;
+
+/* ---- Fault reporting ----
+ * Nothing in this project calls ESP_ERROR_CHECK any more. A rejected preset or a
+ * failing driver call used to panic and reboot, which put the reason in a boot
+ * loop and left the pins dead with no explanation. Now the first failure is
+ * recorded, every task that drives a waveform stops, and a reporting task
+ * repeats the reason on the console this often, indefinitely. */
+#define FAULT_REPORT_PERIOD_MS  3000U
 
 /* ---- Function prototypes ---- */
-void rmt_burst_init(void);
+
+/* Returns ESP_OK, or the error that stopped it -- in which case the fault
+ * reporting task has already been started and no waveform is being generated.
+ * The caller does not need to log anything itself. */
+esp_err_t rmt_burst_init(void);
+
 void rmt_burst_task(void *arg);
 
 #endif /* US_TST2_H */
